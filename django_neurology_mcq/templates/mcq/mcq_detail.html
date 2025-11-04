@@ -1079,11 +1079,7 @@ window.addEventListener('unhandledrejection', (event) => {
 
 setInterval(() => flushAdminEvents(false), 5000);
 
-function copyDebugLog() {
-    if (!navigator.clipboard) {
-        alert('Clipboard API not available in this browser.');
-        return;
-    }
+async function copyDebugLog() {
     if (!adminDebugLogEntries.length) {
         alert('No log entries to copy yet.');
         return;
@@ -1091,12 +1087,38 @@ function copyDebugLog() {
     const text = adminDebugLogEntries
         .map(entry => `[${new Date(entry.timestamp).toLocaleTimeString()}] ${entry.message}`)
         .join('\n');
-    navigator.clipboard.writeText(text)
-        .then(() => alert('Debug log copied to clipboard.'))
-        .catch(() => alert('Unable to copy log automatically. Please copy manually.'));
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            alert('Debug log copied to clipboard.');
+        } else {
+            throw new Error('Clipboard API unavailable');
+        }
+    } catch (error) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            const successful = document.execCommand('copy');
+            if (successful) {
+                alert('Debug log copied to clipboard.');
+            } else {
+                throw new Error('execCommand returned false');
+            }
+        } catch (fallbackError) {
+            alert('Unable to copy debug log to clipboard. Please copy manually.');
+        } finally {
+            document.body.removeChild(textarea);
+        }
+    }
 }
 
-function normalizeConsoleArg(arg) {
+const normalizeConsoleArg = (arg) => {
     if (arg instanceof Error) {
         return {
             name: arg.name,
@@ -1112,7 +1134,7 @@ function normalizeConsoleArg(arg) {
     } catch (error) {
         return String(arg);
     }
-}
+};
 
 function enqueueAdminEvent(event) {
     if (!ADMIN_DEBUG_CONFIG.logEndpoint) {
