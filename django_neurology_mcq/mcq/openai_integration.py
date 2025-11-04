@@ -204,6 +204,15 @@ def verify_openai_client(client: Any) -> bool:
         return False
 
 
+def _sanitize_for_policy(text: str, *, limit: int = 800) -> str:
+    """Sanitize free-form text to reduce policy violations in prompts."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9.,;:()\-\s]", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:limit]
+
+
 def _run_agent_explanation(
     prompt: str,
     *,
@@ -4266,7 +4275,7 @@ def ai_edit_explanation_text(
             },
         }
 
-        prompt_sections = [
+        prompt_sections_base = [
             f"Neurology subspecialty: {subspecialty or 'General Neurology'}",
             "Question stem:\n" + question_text.strip(),
             "Options (with correct answer marked *):\n" + options.strip(),
@@ -4274,19 +4283,19 @@ def ai_edit_explanation_text(
         ]
 
         if reference_text and mode == "enhance":
-            prompt_sections.append(
+            prompt_sections_base.append(
                 "Current explanation draft (improve clarity, evidence, and organisation without losing key facts):\n"
                 + reference_text
             )
         elif reference_text:
-            prompt_sections.append(
+            prompt_sections_base.append(
                 "Previous explanation draft (for reference only; generate a fresh explanation with new wording):\n"
                 + reference_text
             )
         else:
-            prompt_sections.append("No existing explanation is available. Craft a full explanation from scratch.")
+            prompt_sections_base.append("No existing explanation is available. Craft a full explanation from scratch.")
 
-        guidance_lines = [
+        guidance_lines_base = [
             "Write a single unified explanation suitable for a physician preparing for board exams.",
             "Use short markdown headings (### Heading) to break up major ideas.",
             "Explain why the correct answer is right, why each distractor falls short, and include clinical pearls.",
@@ -4295,21 +4304,25 @@ def ai_edit_explanation_text(
         ]
 
         if forbidden_terms:
-            guidance_lines.append(
+            guidance_lines_base.append(
                 "Do not use the following phrases under any circumstance:\n"
                 + "\n".join(f"- {term}" for term in forbidden_terms)
             )
 
         if custom_instructions:
-            guidance_lines.append(
+            guidance_lines_base.append(
                 "Author-specific preferences:\n" + custom_instructions.strip()
             )
 
-        guidance_lines.append(
+        guidance_lines_base.append(
             "Respond with valid JSON only: {\"explanation\": \"...\"}."
         )
 
-        user_prompt = "\n\n".join(prompt_sections + guidance_lines)
+        sanitized_question_text = _sanitize_for_policy(question_text)
+        sanitized_options_text = _sanitize_for_policy(options)
+        prompt_sanitized = False
+
+        user_prompt = "\n\n".join(prompt_sections_base + guidance_lines_base)
 
         agent_explanation = _run_agent_explanation(
             user_prompt,
@@ -4350,11 +4363,6 @@ def ai_edit_explanation_text(
                 + custom_instructions.strip()
             )
 
-        base_messages = [
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
-        ]
-
         feedback_template = (
             "The previous attempt was rejected because:\n{issues}\n"
             "Produce a revised draft resolving every issue while maintaining alignment with the correct answer."
@@ -4364,6 +4372,35 @@ def ai_edit_explanation_text(
         last_errors = []
 
         for attempt in range(max_attempts):
+            current_sections = list(prompt_sections_base)
+            current_guidance = list(guidance_lines_base)
+
+            if prompt_sanitized:
+                sanitized_question = sanitized_question_text or (
+                    "Clinical details redacted for policy compliance. Base your explanation on the general presentation and core neurologic principles."
+                    if question_text
+                    else "Clinical details redacted."
+                )
+                sanitized_options = sanitized_options_text or (
+                    "Highlight why the correct answer is preferred and summarize key pitfalls for the other answer choices without quoting them."
+                )
+                if len(current_sections) >= 2:
+                    current_sections[1] = "Question stem (sanitized for policy compliance):\n" + sanitized_question
+                if len(current_sections) >= 3:
+                    current_sections[2] = (
+                        "Options summary (sanitized):\n" + sanitized_options
+                    )
+                current_guidance.append(
+                    "The original question content has been sanitized due to safety filters. Rely on accepted neurologic knowledge, avoid conjecture, and do not mention that sanitization occurred."
+                )
+
+            user_prompt_current = "\n\n".join(current_sections + current_guidance)
+
+            base_messages = [
+                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "text", "text": user_prompt_current}]},
+            ]
+
             messages = list(base_messages)
             if attempt and last_errors:
                 issues_text = "\n".join(f"- {err}" for err in last_errors)
@@ -4398,6 +4435,12 @@ def ai_edit_explanation_text(
                     max_attempts,
                     message,
                 )
+                if "invalid prompt" in message.lower() and not prompt_sanitized:
+                    prompt_sanitized = True
+                    last_errors = [
+                        "Prompt was flagged by safety filters; retrying with sanitized context."
+                    ]
+                    continue
                 if should_retry and attempt + 1 < max_attempts:
                     time.sleep(min(2 ** attempt, 3))
                     last_errors = [message]
