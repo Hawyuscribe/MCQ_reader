@@ -939,9 +939,12 @@
 {% if user.is_superuser %}
 <!-- Admin Debug Console -->
 <div id="admin-debug-console" style="position: fixed; top: 10px; right: 10px; width: 450px; max-height: 400px; overflow-y: auto; background: #1a1a1a; color: #00ff00; font-family: 'Courier New', monospace; font-size: 11px; border: 2px solid #333; border-radius: 8px; z-index: 10000; padding: 10px;">
-    <div style="background: #333; color: #fff; padding: 5px; margin: -10px -10px 10px -10px; text-align: center; font-weight: bold;">
+    <div style="background: #333; color: #fff; padding: 5px; margin: -10px -10px 10px -10px; text-align: center; font-weight: bold; position: sticky; top: -10px; z-index: 10;">
         🔧 Admin Debug Console - MCQ {{ mcq.id }}
-        <button onclick="document.getElementById('admin-debug-console').style.display='none'" style="float: right; background: #ff4444; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer;">×</button>
+        <div style="float: right; display: flex; gap: 4px;">
+            <button onclick="copyDebugLog()" style="background: #0d6efd; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px;">📋 Copy Log</button>
+        </div>
+        <button onclick="document.getElementById('admin-debug-console').style.display='none'" style="position: absolute; top: 5px; right: 5px; background: #ff4444; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer;">×</button>
     </div>
     
     <!-- Case Conversion Debug Controls -->
@@ -957,6 +960,15 @@
 
 <script>
 window.__MCQ_CORE_ACTIVE = true;
+
+const ADMIN_DEBUG_CONFIG = {
+    logEndpoint: "{% url 'admin_log_client_event' %}",
+    sessionKey: "{{ request.session.session_key|default:'' }}",
+};
+const adminDebugLogEntries = [];
+const adminEventBuffer = [];
+const nativeFetch = window.fetch.bind(window);
+
 // Custom console for admins
 function debugLog(message, type) {
     type = type || 'log';
@@ -967,6 +979,174 @@ function debugLog(message, type) {
         debugDiv.innerHTML += '<div style="color: ' + color + '; margin-bottom: 3px;">[' + timestamp + '] ' + message + '</div>';
         debugDiv.scrollTop = debugDiv.scrollHeight;
     }
+    adminDebugLogEntries.push({ timestamp: new Date().toISOString(), type, message });
+}
+
+window.fetch = function(input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const method = (init && init.method) || 'GET';
+    const shouldInstrument = url && (!ADMIN_DEBUG_CONFIG.logEndpoint || !url.includes(ADMIN_DEBUG_CONFIG.logEndpoint));
+    const start = performance.now();
+
+    if (shouldInstrument) {
+        debugLog(`🌐 ${method} ${url}`);
+        enqueueAdminEvent({
+            event_type: 'frontend_fetch_request',
+            message: `${method} ${url}`,
+            severity: 'info',
+            payload: { url, method },
+        });
+    }
+
+    return nativeFetch(input, init)
+        .then(response => {
+            if (shouldInstrument) {
+                const elapsed = Math.round(performance.now() - start);
+                debugLog(`✅ ${response.status} ${method} ${url} (${elapsed}ms)`);
+                enqueueAdminEvent({
+                    event_type: 'frontend_fetch_response',
+                    message: `${response.status} ${method} ${url}`,
+                    severity: response.ok ? 'success' : 'warning',
+                    payload: { url, method, status: response.status, elapsed_ms: elapsed },
+                });
+            }
+            return response;
+        })
+        .catch(error => {
+            if (shouldInstrument) {
+                const elapsed = Math.round(performance.now() - start);
+                debugLog(`❌ Fetch failed for ${url}: ${error}`, 'error');
+                enqueueAdminEvent({
+                    event_type: 'frontend_fetch_error',
+                    message: `Fetch failed for ${url}: ${error}`,
+                    severity: 'error',
+                    payload: { url, method, error: String(error), elapsed_ms: elapsed },
+                });
+            }
+            throw error;
+        });
+};
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        flushAdminEvents(true);
+    }
+});
+
+window.addEventListener('beforeunload', () => flushAdminEvents(true));
+
+document.addEventListener('click', (event) => {
+    const target = event.target.closest('button, a, [role="button"], input[type="submit"], [data-action]');
+    if (!target) {
+        return;
+    }
+    const descriptor = target.getAttribute('data-debug-label') || target.getAttribute('aria-label') || target.textContent.trim().slice(0, 80) || target.tagName.toLowerCase();
+    debugLog(`🖱️ Clicked ${descriptor}`);
+    enqueueAdminEvent({
+        event_type: 'frontend_click',
+        message: `Clicked ${descriptor}`,
+        severity: 'info',
+        payload: {
+            tag: target.tagName,
+            id: target.id,
+            classes: target.className,
+            text: descriptor,
+        },
+    });
+}, true);
+
+window.addEventListener('error', (event) => {
+    enqueueAdminEvent({
+        event_type: 'frontend_error',
+        message: event.message || 'Unhandled error',
+        severity: 'error',
+        payload: {
+            filename: event.filename,
+            lineno: event.lineno,
+            colno: event.colno,
+        },
+    });
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+    enqueueAdminEvent({
+        event_type: 'frontend_rejection',
+        message: event.reason ? (event.reason.message || String(event.reason)) : 'Unhandled promise rejection',
+        severity: 'error',
+        payload: {},
+    });
+});
+
+setInterval(() => flushAdminEvents(false), 5000);
+
+function copyDebugLog() {
+    if (!navigator.clipboard) {
+        alert('Clipboard API not available in this browser.');
+        return;
+    }
+    if (!adminDebugLogEntries.length) {
+        alert('No log entries to copy yet.');
+        return;
+    }
+    const text = adminDebugLogEntries
+        .map(entry => `[${new Date(entry.timestamp).toLocaleTimeString()}] ${entry.message}`)
+        .join('\n');
+    navigator.clipboard.writeText(text)
+        .then(() => alert('Debug log copied to clipboard.'))
+        .catch(() => alert('Unable to copy log automatically. Please copy manually.'));
+}
+
+function normalizeConsoleArg(arg) {
+    if (arg instanceof Error) {
+        return {
+            name: arg.name,
+            message: arg.message,
+            stack: arg.stack,
+        };
+    }
+    if (typeof arg === 'string') {
+        return arg;
+    }
+    try {
+        return JSON.parse(JSON.stringify(arg));
+    } catch (error) {
+        return String(arg);
+    }
+}
+
+function enqueueAdminEvent(event) {
+    if (!ADMIN_DEBUG_CONFIG.logEndpoint) {
+        return;
+    }
+    event.timestamp = event.timestamp || new Date().toISOString();
+    event.session_key = ADMIN_DEBUG_CONFIG.sessionKey || '';
+    adminEventBuffer.push(event);
+    if (adminEventBuffer.length >= 10) {
+        flushAdminEvents();
+    }
+}
+
+function flushAdminEvents(force) {
+    if (!adminEventBuffer.length) {
+        return;
+    }
+    const batch = adminEventBuffer.splice(0, adminEventBuffer.length);
+    const payload = JSON.stringify({ events: batch });
+
+    if ((force || document.visibilityState === 'hidden') && navigator.sendBeacon) {
+        const blob = new Blob([payload], { type: 'application/json' });
+        navigator.sendBeacon(ADMIN_DEBUG_CONFIG.logEndpoint, blob);
+        return;
+    }
+
+    nativeFetch(ADMIN_DEBUG_CONFIG.logEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        keepalive: true,
+    }).catch(() => {
+        adminEventBuffer.unshift(...batch);
+    });
 }
 
 // Override console methods for admins
@@ -978,24 +1158,52 @@ if (typeof console !== 'undefined') {
     console.log = function() {
         const message = Array.prototype.slice.call(arguments).join(' ');
         debugLog(message, 'log');
+        enqueueAdminEvent({
+            event_type: 'frontend_log',
+            message,
+            severity: 'info',
+            payload: { arguments: Array.from(arguments, normalizeConsoleArg) },
+        });
         originalLog.apply(console, arguments);
     };
 
     console.error = function() {
         const message = Array.prototype.slice.call(arguments).join(' ');
         debugLog(message, 'error');
+        enqueueAdminEvent({
+            event_type: 'frontend_console_error',
+            message,
+            severity: 'error',
+            payload: { arguments: Array.from(arguments, normalizeConsoleArg) },
+        });
         originalError.apply(console, arguments);
     };
 
     console.warn = function() {
         const message = Array.prototype.slice.call(arguments).join(' ');
         debugLog(message, 'warn');
+        enqueueAdminEvent({
+            event_type: 'frontend_console_warn',
+            message,
+            severity: 'warning',
+            payload: { arguments: Array.from(arguments, normalizeConsoleArg) },
+        });
         originalWarn.apply(console, arguments);
     };
 }
 
 debugLog('MCQ Detail page loaded - JavaScript is working');
 debugLog('Testing if JavaScript execution reaches this point...');
+
+enqueueAdminEvent({
+    event_type: 'frontend_console_ready',
+    message: 'Inline admin debug console initialised',
+    severity: 'info',
+    payload: {
+        mcq_id: {{ mcq.id }},
+        path: window.location.pathname,
+    },
+});
 
 // Load case conversion debugging information for this MCQ
 debugLog('🔄 Loading MCQ case conversion debug info...');
@@ -1197,6 +1405,7 @@ function clearDebugLog() {
         debugDiv.innerHTML = '';
         debugLog('🧹 Debug log cleared');
     }
+    adminDebugLogEntries.length = 0;
 }
 
 // Add test conversion button functionality
