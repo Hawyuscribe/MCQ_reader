@@ -471,6 +471,10 @@ let debugEvents = initialEventsData.slice();
 let latestEventId = ADMIN_DEBUG.initialCursor || (debugEvents.length ? debugEvents[debugEvents.length - 1].id : null);
 const clientEventBuffer = [];
 const eventTimelineEl = document.getElementById('eventTimeline');
+const originalConsole = {
+    error: window.console.error.bind(window.console),
+    warn: window.console.warn.bind(window.console),
+};
 
 function renderEventTimeline() {
     if (!eventTimelineEl) {
@@ -643,6 +647,56 @@ window.addEventListener('unhandledrejection', (event) => {
         payload: {},
     });
 });
+
+function normalizeConsoleArg(arg) {
+    if (arg instanceof Error) {
+        return {
+            name: arg.name,
+            message: arg.message,
+            stack: arg.stack,
+        };
+    }
+    if (typeof arg === 'string') {
+        return arg;
+    }
+    try {
+        return JSON.parse(JSON.stringify(arg));
+    } catch (err) {
+        return String(arg);
+    }
+}
+
+window.console.error = function (...args) {
+    try {
+        enqueueClientEvent({
+            event_type: 'frontend_console_error',
+            message: args.length ? String(args[0]) : 'console.error invoked',
+            severity: 'error',
+            payload: {
+                arguments: args.map(normalizeConsoleArg),
+            },
+        });
+    } catch (err) {
+        originalConsole.error('Failed to capture console.error payload', err);
+    }
+    originalConsole.error(...args);
+};
+
+window.console.warn = function (...args) {
+    try {
+        enqueueClientEvent({
+            event_type: 'frontend_console_warn',
+            message: args.length ? String(args[0]) : 'console.warn invoked',
+            severity: 'warning',
+            payload: {
+                arguments: args.map(normalizeConsoleArg),
+            },
+        });
+    } catch (err) {
+        originalConsole.error('Failed to capture console.warn payload', err);
+    }
+    originalConsole.warn(...args);
+};
 
 window.fetch = function(input, init) {
     const url = typeof input === 'string' ? input : input?.url || '';
