@@ -25,6 +25,7 @@ from datetime import timedelta
 import json
 import re
 import logging
+from django.core.serializers.json import DjangoJSONEncoder
 
 from .models import (
     MCQ,
@@ -36,6 +37,7 @@ from .models import (
     PersistentCaseLearningSession,
     CognitiveReasoningSession,
     MCQCaseConversionSession,
+    AdminDebugEvent,
 )
 try:
     from .models import HiddenMCQ
@@ -53,6 +55,7 @@ from .openai_integration import (
 )
 from django.core.cache import cache
 import uuid
+from .admin_debug import record_admin_debug_event, serialize_events
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -4530,86 +4533,223 @@ def admin_debug_console(request):
     """
     🔧 Admin Debug Console for MCQ Case Conversion Session Tracking
     Comprehensive debugging interface for tracking session mismatches
+    and unified activity logging across frontend and backend flows.
     """
     from django.contrib.sessions.models import Session
-    from datetime import datetime, timedelta
-    import json
-    
-    # Get recent MCQ conversion sessions
-    recent_sessions = MCQCaseConversionSession.objects.filter(
-        created_at__gte=timezone.now() - timedelta(hours=24)
-    ).order_by('-created_at')[:20]
-    
-    # Get recent Django sessions with case data
-    django_sessions = []
-    for django_session in Session.objects.filter(
-        expire_date__gte=timezone.now()
-    ).order_by('-expire_date')[:50]:
+
+    now = timezone.now()
+    record_admin_debug_event(
+        "console_opened",
+        "Admin Debug Console opened",
+        request=request,
+        source="backend",
+        severity="info",
+    )
+
+    recent_sessions_qs = (
+        MCQCaseConversionSession.objects.select_related("user", "mcq")
+        .filter(created_at__gte=now - timedelta(hours=24))
+        .order_by("-created_at")
+    )
+
+    # Django session snapshot
+    django_sessions: list[dict[str, object]] = []
+    for django_session in Session.objects.filter(expire_date__gte=now).order_by("-expire_date")[:50]:
         try:
             session_data = django_session.get_decoded()
-            case_keys = [key for key in session_data.keys() if key.startswith('case_session_')]
-            if case_keys:
-                for case_key in case_keys:
-                    case_data = session_data[case_key]
-                    django_sessions.append({
-                        'session_key': django_session.session_key[:10] + '...',
-                        'case_key': case_key,
-                        'mcq_id': case_data.get('mcq_id'),
-                        'user_id': case_data.get('user_id'),
-                        'created_at': case_data.get('created_at'),
-                        'expire_date': django_session.expire_date
-                    })
         except Exception:
             continue
-    
-    # Analyze for mismatches
+        case_keys = [key for key in session_data.keys() if key.startswith("case_session_")]
+        for case_key in case_keys:
+            case_data = session_data.get(case_key, {}) or {}
+            django_sessions.append(
+                {
+                    "session_key": f"{django_session.session_key[:10]}...",
+                    "case_key": case_key,
+                    "mcq_id": case_data.get("mcq_id"),
+                    "user_id": case_data.get("user_id"),
+                    "created_at": case_data.get("created_at"),
+                    "expire_date": django_session.expire_date,
+                }
+            )
+
+    # Conversion session analysis
     session_analysis = []
-    mismatch_count = 0
-    
-    for session in recent_sessions:
+    session_mismatches = []
+    integrity_scores = []
+    recent_sessions_table = []
+
+    for session in recent_sessions_qs[:50]:
         analysis = {
-            'conversion_session': session,
-            'status': session.status,
-            'has_mismatch': False,
-            'mismatch_details': [],
-            'case_source_mcq_id': None,
-            'integrity_score': 100
+            "conversion_session": session,
+            "status": session.status,
+            "has_mismatch": False,
+            "mismatch_details": [],
+            "case_source_mcq_id": None,
+            "integrity_score": 100,
         }
-        
-        if session.case_data:
-            case_source_id = session.case_data.get('source_mcq_id')
-            analysis['case_source_mcq_id'] = case_source_id
-            
-            # Check for basic MCQ ID mismatch
-            if case_source_id != session.mcq_id:
-                analysis['has_mismatch'] = True
-                analysis['mismatch_details'].append(f"MCQ ID mismatch: Session={session.mcq_id}, Case={case_source_id}")
-                analysis['integrity_score'] -= 50
-                mismatch_count += 1
-            
-            # Check patient demographics consistency
-            demographics = session.case_data.get('patient_demographics', '')
-            if demographics and 'unknown' in demographics.lower():
-                analysis['mismatch_details'].append("Patient demographics contain 'unknown'")
-                analysis['integrity_score'] -= 10
-            
-            # Check case validation results
-            validation = session.case_data.get('professional_validation', {})
-            if validation.get('score', 0) < 80:
-                analysis['mismatch_details'].append(f"Low validation score: {validation.get('score', 0)}")
-                analysis['integrity_score'] -= 20
-        
+
+        case_data = session.case_data or {}
+        case_source_id = case_data.get("source_mcq_id")
+        analysis["case_source_mcq_id"] = case_source_id
+
+        if case_source_id is not None and case_source_id != session.mcq_id:
+            analysis["has_mismatch"] = True
+            analysis["mismatch_details"].append(
+                f"MCQ ID mismatch: Session={session.mcq_id}, Case={case_source_id}"
+            )
+            analysis["integrity_score"] -= 50
+
+        demographics = (case_data.get("patient_demographics") or "").lower()
+        if demographics and "unknown" in demographics:
+            analysis["mismatch_details"].append("Patient demographics contain 'unknown'")
+            analysis["integrity_score"] -= 10
+
+        validation = case_data.get("professional_validation") or {}
+        validation_score = validation.get("score", 0)
+        if validation_score < 80:
+            analysis["mismatch_details"].append(f"Low validation score: {validation_score}")
+            analysis["integrity_score"] -= 20
+
+        if analysis["has_mismatch"]:
+            session_mismatches.append(
+                {
+                    "id": session.id,
+                    "mcq_id": session.mcq_id,
+                    "case_mcq_id": case_source_id,
+                    "user_username": getattr(session.user, "username", "Unknown"),
+                    "created_at": session.created_at,
+                    "status": session.status.upper(),
+                }
+            )
+
         session_analysis.append(analysis)
-    
+        integrity_scores.append(analysis["integrity_score"])
+
+        recent_sessions_table.append(
+            {
+                "id": session.id,
+                "mcq_id": session.mcq_id,
+                "user_username": getattr(session.user, "username", "Unknown"),
+                "subspecialty": getattr(session.mcq, "subspecialty", "Unknown"),
+                "created_at": session.created_at,
+                "validation_score": validation_score,
+                "status": session.status.upper(),
+            }
+        )
+
+    overall_integrity_score = round(
+        sum(integrity_scores) / len(integrity_scores), 1
+    ) if integrity_scores else 100.0
+
+    # Unified event log
+    initial_events_qs = AdminDebugEvent.objects.select_related("user").order_by("-occurred_at", "-id")[:200]
+    initial_events_list = list(serialize_events(reversed(list(initial_events_qs))))
+    initial_event_cursor = initial_events_list[-1]["id"] if initial_events_list else None
+
     context = {
-        'session_analysis': session_analysis,
-        'django_sessions': django_sessions[:10],  # Limit for display
-        'mismatch_count': mismatch_count,
-        'total_sessions': recent_sessions.count(),
-        'debug_timestamp': timezone.now()
+        "session_analysis": session_analysis,
+        "django_sessions": django_sessions[:10],
+        "mismatch_count": len(session_mismatches),
+        "session_mismatches": session_mismatches,
+        "recent_sessions": recent_sessions_table[:15],
+        "recent_successful_conversions": len(recent_sessions_table),
+        "total_sessions": recent_sessions_qs.count(),
+        "total_django_sessions": len(django_sessions),
+        "overall_integrity_score": overall_integrity_score,
+        "debug_timestamp": now,
+        "initial_event_log": initial_events_list,
+        "initial_event_cursor": initial_event_cursor,
+        "total_event_count": AdminDebugEvent.objects.count(),
+        "session_key": getattr(request.session, "session_key", "") or "",
     }
-    
-    return render(request, 'mcq/admin_debug_console.html', context)
+
+    return render(request, "mcq/admin_debug_console.html", context)
+
+
+@staff_member_required
+def admin_debug_events_api(request):
+    """
+    Fetch admin debug events newer than the provided cursor.
+    """
+    try:
+        since = request.GET.get("since")
+        limit = request.GET.get("limit")
+        queryset = AdminDebugEvent.objects.select_related("user")
+        if since:
+            try:
+                since_id = int(since)
+            except ValueError:
+                return JsonResponse({"error": "Invalid 'since' cursor."}, status=400)
+            queryset = queryset.filter(id__gt=since_id)
+
+        limit_value = 200
+        if limit:
+            try:
+                limit_value = max(1, min(int(limit), 500))
+            except ValueError:
+                pass
+
+        events = list(serialize_events(queryset.order_by("id")[:limit_value]))
+        latest = events[-1]["id"] if events else None
+
+        return JsonResponse(
+            {
+                "events": events,
+                "latest": latest,
+                "total_events": AdminDebugEvent.objects.count(),
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to fetch admin debug events: %s", exc)
+        return JsonResponse({"error": str(exc)}, status=500)
+
+
+@staff_member_required
+@csrf_exempt
+def admin_log_client_event(request):
+    """
+    Receive batched frontend instrumentation events from the Admin Debug Console.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+    events = payload.get("events", [])
+    if not isinstance(events, list):
+        return JsonResponse({"error": "Events payload must be a list."}, status=400)
+
+    saved_events = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("event_type", "frontend_event")
+        message = event.get("message", "").strip() or event_type.replace("_", " ").title()
+        severity = event.get("severity", "info")
+        source = event.get("source", "frontend")
+        occurred_at = event.get("timestamp")
+        payload_data = event.get("payload") or {}
+        session_key = event.get("session_key", "")
+
+        saved_events.append(
+            record_admin_debug_event(
+                event_type,
+                message,
+                severity=severity,
+                source=source,
+                request=request,
+                payload=payload_data,
+                session_key=session_key,
+                occurred_at=occurred_at,
+            )
+        )
+
+    latest_id = saved_events[-1].id if saved_events else None
+    return JsonResponse({"success": True, "saved": len(saved_events), "latest": latest_id})
 
 
 @staff_member_required
@@ -4739,12 +4879,37 @@ def debug_session_integrity(request):
             total_checks = len(integrity_report['checks'])
             passed_checks = len([c for c in integrity_report['checks'] if c['status'] == 'PASS'])
             integrity_report['integrity_score'] = (passed_checks / total_checks * 100) if total_checks > 0 else 0
-            
+
+            record_admin_debug_event(
+                "backend_integrity_report",
+                f"Integrity check executed for session {session_id}",
+                severity="success",
+                source="backend",
+                request=request,
+                payload=integrity_report,
+            )
+
             return JsonResponse(integrity_report)
-            
+
         except json.JSONDecodeError:
+            record_admin_debug_event(
+                "backend_integrity_report_error",
+                "Integrity check failed: invalid JSON payload",
+                severity="error",
+                source="backend",
+                request=request,
+                payload={'body': request.body.decode('utf-8', errors='ignore')},
+            )
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
         except Exception as e:
+            record_admin_debug_event(
+                "backend_integrity_report_error",
+                f"Integrity check failed for session {request.body}: {e}",
+                severity="error",
+                source="backend",
+                request=request,
+                payload={'error': str(e)},
+            )
             return JsonResponse({'error': str(e)}, status=500)
     
     return JsonResponse({'error': 'Method not allowed'}, status=405)
@@ -4795,15 +4960,39 @@ def debug_clear_session_cache(request):
                 cleared_items['conversion_sessions'] = old_sessions.count()
                 old_sessions.delete()
             
-            return JsonResponse({
+            response_payload = {
                 'success': True,
-                'message': f'Cache clearing completed',
+                'message': 'Cache clearing completed',
                 'cleared': cleared_items
-            })
+            }
+            record_admin_debug_event(
+                "backend_cache_clear",
+                f"Cache clear executed ({action})",
+                severity="success",
+                source="backend",
+                request=request,
+                payload=response_payload,
+            )
+            return JsonResponse(response_payload)
             
         except json.JSONDecodeError:
+            record_admin_debug_event(
+                "backend_cache_clear_error",
+                "Cache clear failed: invalid JSON payload",
+                severity="error",
+                source="backend",
+                request=request,
+            )
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
         except Exception as e:
+            record_admin_debug_event(
+                "backend_cache_clear_error",
+                f"Cache clear failed: {e}",
+                severity="error",
+                source="backend",
+                request=request,
+                payload={'error': str(e)},
+            )
             return JsonResponse({'error': str(e)}, status=500)
     
     return JsonResponse({'error': 'Method not allowed'}, status=405)
@@ -4921,9 +5110,25 @@ def debug_trace_mcq_conversion(request, mcq_id):
             
             trace_data['conversion_sessions'].append(session_info)
         
+        record_admin_debug_event(
+            "backend_trace_mcq",
+            f"Trace generated for MCQ {mcq_id}",
+            severity="info",
+            source="backend",
+            request=request,
+            payload=trace_data,
+        )
         return JsonResponse(trace_data)
         
     except Exception as e:
+        record_admin_debug_event(
+            "backend_trace_mcq_error",
+            f"Trace failed for MCQ {mcq_id}: {e}",
+            severity="error",
+            source="backend",
+            request=request,
+            payload={'error': str(e)},
+        )
         return JsonResponse({'error': str(e)}, status=500)
 
 

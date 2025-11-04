@@ -4,6 +4,32 @@
 
 {% block content %}
 <div class="container-fluid">
+    {{ initial_event_log|json_script:"admin-debug-initial-events" }}
+    <style>
+        .debug-event-timeline {
+            max-height: 420px;
+            overflow-y: auto;
+            font-family: var(--bs-font-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+            font-size: 0.9rem;
+        }
+        .debug-event-entry {
+            border-left: 3px solid transparent;
+            padding-left: 1rem;
+            margin-bottom: 0.75rem;
+        }
+        .debug-event-entry .meta {
+            font-size: 0.75rem;
+        }
+        .debug-event-entry.info { border-color: #0d6efd; }
+        .debug-event-entry.success { border-color: #198754; }
+        .debug-event-entry.warning { border-color: #ffc107; }
+        .debug-event-entry.error,
+        .debug-event-entry.critical { border-color: #dc3545; }
+        .debug-event-entry .badge {
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+    </style>
     <div class="row">
         <div class="col-12">
             <div class="d-flex justify-content-between align-items-center mb-4">
@@ -70,12 +96,52 @@
                             </button>
                             <div id="liveMonitorStatus" class="mt-2 small text-muted"></div>
                         </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Unified Activity Log -->
+    <div class="card border-dark mb-4">
+        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <div>
+                <h5 class="mb-0">🛰 Unified Activity Log</h5>
+                <small class="text-muted">Frontend interactions · Backend actions · API responses</small>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-light btn-sm" onclick="refreshEventLog(true)">
+                    🔄 Refresh
+                </button>
+                <button class="btn btn-light btn-sm" onclick="copyFullDebugLog()">
+                    📋 Copy Full Log
+                </button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <div class="alert alert-secondary py-2 mb-0">
+                        <strong>Total events:</strong> {{ total_event_count }}
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="alert alert-info py-2 mb-0">
+                        <strong>Tracked Django sessions:</strong> {{ total_django_sessions }}
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="alert alert-success py-2 mb-0">
+                        <strong>Integrity score:</strong> {{ overall_integrity_score }}%
                     </div>
                 </div>
             </div>
+            <div id="eventTimeline" class="debug-event-timeline pe-2">
+                <p class="text-muted mb-0">Loading activity log…</p>
+            </div>
+        </div>
+    </div>
 
-            <!-- Tracking Dashboard -->
-            <div class="row mb-4">
+    <!-- Tracking Dashboard -->
+    <div class="row mb-4">
                 <div class="col-12">
                     <div class="card border-success">
                         <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
@@ -379,6 +445,265 @@
 </div>
 
 <script>
+const ADMIN_DEBUG = {
+    logEndpoint: "{% url 'admin_log_client_event' %}",
+    eventsEndpoint: "{% url 'admin_debug_events' %}",
+    csrfToken: "{{ csrf_token }}",
+    sessionKey: "{{ session_key }}",
+    initialCursor: {{ initial_event_cursor|default:'null' }},
+};
+
+const nativeFetch = window.fetch.bind(window);
+const initialEventsData = (() => {
+    const script = document.getElementById('admin-debug-initial-events');
+    if (!script) {
+        return [];
+    }
+    try {
+        return JSON.parse(script.textContent || '[]');
+    } catch (error) {
+        console.warn('Failed to parse initial debug events', error);
+        return [];
+    }
+})();
+
+let debugEvents = initialEventsData.slice();
+let latestEventId = ADMIN_DEBUG.initialCursor || (debugEvents.length ? debugEvents[debugEvents.length - 1].id : null);
+const clientEventBuffer = [];
+const eventTimelineEl = document.getElementById('eventTimeline');
+
+function renderEventTimeline() {
+    if (!eventTimelineEl) {
+        return;
+    }
+    if (!debugEvents.length) {
+        eventTimelineEl.innerHTML = '<p class="text-muted mb-0">No events recorded yet.</p>';
+        return;
+    }
+    const items = debugEvents.slice().reverse().map(event => {
+        const severityClass = event.severity || 'info';
+        const sourceBadge = `<span class="badge bg-dark me-1">${(event.source || 'unknown').toUpperCase()}</span>`;
+        const severityBadge = `<span class="badge bg-${severityClass === 'info' ? 'primary' : severityClass === 'success' ? 'success' : severityClass === 'warning' ? 'warning' : 'danger'} me-1">${severityClass.toUpperCase()}</span>`;
+        const timestamp = new Date(event.occurred_at).toLocaleString();
+        const message = event.message || '(no message)';
+        const payload = event.payload && Object.keys(event.payload).length
+            ? `<pre class="bg-light border rounded mt-2 p-2 mb-0 text-break">${JSON.stringify(event.payload, null, 2)}</pre>`
+            : '';
+        return `
+            <div class="debug-event-entry ${severityClass}">
+                <div class="d-flex align-items-center mb-1">
+                    ${sourceBadge}${severityBadge}
+                    <span class="meta text-muted ms-1">${timestamp}${event.user ? ' · ' + event.user : ''}</span>
+                </div>
+                <div>${message}</div>
+                ${payload}
+            </div>
+        `;
+    });
+    eventTimelineEl.innerHTML = items.join('');
+}
+
+function copyFullDebugLog() {
+    if (!debugEvents.length) {
+        alert('No events to copy yet.');
+        return;
+    }
+    const logText = debugEvents
+        .map(event => `${event.occurred_at} [${(event.source || 'unknown').toUpperCase()} | ${(event.severity || 'info').toUpperCase()}] ${event.message}`)
+        .join('\n');
+    navigator.clipboard.writeText(logText)
+        .then(() => alert('Full debug log copied to clipboard.'))
+        .catch(() => alert('Unable to copy log. Please copy manually.'));
+}
+
+function enqueueClientEvent(event) {
+    event.timestamp = event.timestamp || new Date().toISOString();
+    event.source = event.source || 'frontend';
+    event.session_key = ADMIN_DEBUG.sessionKey || '';
+    clientEventBuffer.push(event);
+    if (clientEventBuffer.length >= 15) {
+        flushClientEvents();
+    }
+}
+
+function flushClientEvents(force = false) {
+    if (!clientEventBuffer.length) {
+        return;
+    }
+    const batch = clientEventBuffer.splice(0, clientEventBuffer.length);
+    const payload = JSON.stringify({ events: batch });
+
+    if ((force || document.visibilityState === 'hidden') && navigator.sendBeacon) {
+        const blob = new Blob([payload], { type: 'application/json' });
+        navigator.sendBeacon(ADMIN_DEBUG.logEndpoint, blob);
+        return;
+    }
+
+    nativeFetch(ADMIN_DEBUG.logEndpoint, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: payload,
+        keepalive: true,
+    }).catch(error => {
+        console.warn('Failed to transmit admin debug events', error);
+        // Re-queue events so they are not lost
+        clientEventBuffer.unshift(...batch);
+    });
+}
+
+function mergeNewEvents(events, { replace = false } = {}) {
+    if (!Array.isArray(events) || !events.length) {
+        return;
+    }
+    if (replace) {
+        debugEvents = events;
+    } else {
+        const existingIds = new Set(debugEvents.map(event => event.id));
+        events.forEach(event => {
+            if (!existingIds.has(event.id)) {
+                debugEvents.push(event);
+            }
+        });
+    }
+    latestEventId = events[events.length - 1]?.id || latestEventId;
+    renderEventTimeline();
+}
+
+function fetchEvents(force = false) {
+    const params = new URLSearchParams();
+    if (!force && latestEventId) {
+        params.append('since', latestEventId);
+    } else {
+        params.append('limit', '200');
+    }
+    nativeFetch(`${ADMIN_DEBUG.eventsEndpoint}?${params.toString()}`, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (!data || !Array.isArray(data.events)) {
+                return;
+            }
+            mergeNewEvents(data.events, { replace: force });
+        })
+        .catch(error => console.warn('Failed to refresh admin debug events', error));
+}
+
+function refreshEventLog(force = false) {
+    fetchEvents(force);
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        flushClientEvents(true);
+    }
+});
+window.addEventListener('beforeunload', () => flushClientEvents(true));
+
+// Frontend instrumentation
+document.addEventListener('click', (event) => {
+    const target = event.target.closest('[data-debug-ignore]') || event.target;
+    if (!target) {
+        return;
+    }
+    const descriptor = target.dataset.debugLabel || target.getAttribute('aria-label') || target.innerText.trim().slice(0, 80) || target.tagName.toLowerCase();
+    enqueueClientEvent({
+        event_type: 'frontend_click',
+        message: `Clicked ${descriptor}`,
+        severity: 'info',
+        payload: {
+            tag: target.tagName,
+            id: target.id,
+            classes: target.className,
+            text: descriptor,
+        },
+    });
+}, true);
+
+window.addEventListener('error', (event) => {
+    enqueueClientEvent({
+        event_type: 'frontend_error',
+        message: event.message || 'Unhandled error',
+        severity: 'error',
+        payload: {
+            filename: event.filename,
+            lineno: event.lineno,
+            colno: event.colno,
+        },
+    });
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+    enqueueClientEvent({
+        event_type: 'frontend_rejection',
+        message: event.reason ? (event.reason.message || String(event.reason)) : 'Unhandled promise rejection',
+        severity: 'error',
+        payload: {},
+    });
+});
+
+window.fetch = function(input, init) {
+    const url = typeof input === 'string' ? input : input?.url || '';
+    const method = (init && init.method) || 'GET';
+    const shouldInstrument = url && !url.includes(ADMIN_DEBUG.logEndpoint) && !url.includes(ADMIN_DEBUG.eventsEndpoint);
+    const start = performance.now();
+
+    if (shouldInstrument) {
+        enqueueClientEvent({
+            event_type: 'frontend_fetch_request',
+            message: `${method} ${url}`,
+            severity: 'info',
+            payload: { url, method },
+        });
+    }
+
+    return nativeFetch(input, init)
+        .then(response => {
+            if (shouldInstrument) {
+                enqueueClientEvent({
+                    event_type: 'frontend_fetch_response',
+                    message: `${response.status} ${method} ${url}`,
+                    severity: response.ok ? 'success' : 'warning',
+                    payload: {
+                        url,
+                        method,
+                        status: response.status,
+                        elapsed_ms: Math.round(performance.now() - start),
+                    },
+                });
+            }
+            return response;
+        })
+        .catch(error => {
+            if (shouldInstrument) {
+                enqueueClientEvent({
+                    event_type: 'frontend_fetch_error',
+                    message: `Fetch failed for ${url}: ${error}`,
+                    severity: 'error',
+                    payload: {
+                        url,
+                        method,
+                        error: String(error),
+                        elapsed_ms: Math.round(performance.now() - start),
+                    },
+                });
+            }
+            throw error;
+        });
+};
+
+// Initial render and polling schedule
+renderEventTimeline();
+enqueueClientEvent({
+    event_type: 'frontend_console_ready',
+    message: 'Admin Debug Console loaded',
+    severity: 'info',
+});
+setInterval(() => fetchEvents(false), 8000);
+setInterval(() => flushClientEvents(false), 4000);
+
 function clearSessionCache(action = 'cache_only') {
     if (!confirm('Are you sure you want to clear session cache? This action cannot be undone.')) {
         return;

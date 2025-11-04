@@ -823,6 +823,96 @@ class MCQCaseConversionSession(models.Model):
         return None
 
 
+class AdminDebugEvent(models.Model):
+    """
+    Central event log for the Admin Debug Console.
+    Captures frontend instrumentation, backend actions, API calls, and errors.
+    """
+    SOURCE_CHOICES = [
+        ('frontend', _('Frontend')),
+        ('backend', _('Backend')),
+        ('api', _('API Gateway')),
+        ('system', _('System')),
+    ]
+
+    SEVERITY_CHOICES = [
+        ('info', _('Info')),
+        ('success', _('Success')),
+        ('warning', _('Warning')),
+        ('error', _('Error')),
+        ('critical', _('Critical')),
+    ]
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    occurred_at = models.DateTimeField(default=timezone.now)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='admin_debug_events',
+        help_text=_("User associated with the event, if available."),
+    )
+    session_key = models.CharField(
+        max_length=64,
+        blank=True,
+        help_text=_("Browser session key to correlate frontend events."),
+    )
+    event_type = models.CharField(
+        max_length=64,
+        help_text=_("Event type identifier (e.g., frontend_click, api_response)."),
+    )
+    source = models.CharField(
+        max_length=16,
+        choices=SOURCE_CHOICES,
+        default='backend',
+        help_text=_("Origin of the event."),
+    )
+    severity = models.CharField(
+        max_length=16,
+        choices=SEVERITY_CHOICES,
+        default='info',
+        help_text=_("Severity level for quick filtering."),
+    )
+    message = models.TextField(
+        help_text=_("Human-readable message describing the event."),
+    )
+    payload = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Structured metadata for the event."),
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['-occurred_at']),
+            models.Index(fields=['event_type', '-occurred_at']),
+            models.Index(fields=['source', 'severity']),
+        ]
+        ordering = ['-occurred_at', '-id']
+        verbose_name = _("Admin Debug Event")
+        verbose_name_plural = _("Admin Debug Events")
+
+    def __str__(self) -> str:
+        user_label = self.user.username if self.user else "anonymous"
+        return f"[{self.source}/{self.event_type}] {self.message} ({user_label})"
+
+    def as_dict(self):
+        """Serialize for JSON responses."""
+        return {
+            'id': self.id,
+            'event_type': self.event_type,
+            'source': self.source,
+            'severity': self.severity,
+            'message': self.message,
+            'payload': self.payload,
+            'occurred_at': self.occurred_at.isoformat(),
+            'created_at': self.created_at.isoformat(),
+            'user': self.user.username if self.user else None,
+            'session_key': self.session_key,
+        }
+
+
 class HiddenMCQ(models.Model):
     """
     Tracks MCQs that a user has chosen to hide from view.

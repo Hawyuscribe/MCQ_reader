@@ -120,6 +120,8 @@ urlpatterns = [
     
     # Admin Debug Console URLs (Staff only)
     path('admin/debug/', views.admin_debug_console, name='admin_debug_console'),
+    path('admin/debug/events/', views.admin_debug_events_api, name='admin_debug_events'),
+    path('admin/debug/log-events/', views.admin_log_client_event, name='admin_log_client_event'),
     path('admin/debug/session-integrity/', views.debug_session_integrity, name='debug_session_integrity'),
     path('admin/debug/clear-cache/', views.debug_clear_session_cache, name='debug_clear_session_cache'),
     path('admin/debug/trace-mcq/<int:mcq_id>/', views.debug_trace_mcq_conversion, name='debug_trace_mcq_conversion'),
