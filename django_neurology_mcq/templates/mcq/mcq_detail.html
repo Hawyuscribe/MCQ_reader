@@ -2038,11 +2038,8 @@ setTimeout(function() {
                         </div>
                     </div>
                     <div class="d-flex flex-wrap gap-2 mb-3 align-items-center">
-                        <button type="button" class="btn btn-outline-primary js-ai-explanation" data-ai-target="explanationUnifiedEdit">
-                            <i class="bi bi-magic"></i> Edit with AI
-                        </button>
-                        <button type="button" class="btn btn-outline-warning" id="rewriteExplanationBtn">
-                            <i class="bi bi-stars"></i> Rewrite from scratch
+                        <button type="button" class="btn btn-outline-primary" id="rewriteExplanationBtn" data-ai-target="explanationUnifiedEdit">
+                            <i class="bi bi-magic"></i> Rewrite with AI
                         </button>
                         <button type="button" class="btn btn-outline-secondary" id="explanationRecordBtn" data-record-target="explanationUnifiedEdit">
                             <i class="bi bi-mic"></i> Record
@@ -4797,6 +4794,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 options: "{% url 'ai_edit_mcq_options' mcq.id %}",
                 explanation: "{% url 'ai_edit_mcq_explanation' mcq.id %}",
                 regenerate: "{% url 'regenerate_all_explanations' mcq.id %}",
+                jobStatus: "{% url 'ai_job_status' '00000000-0000-0000-0000-000000000000' %}",
                 transcribe: "{% url 'transcribe_audio_enhanced' %}",
                 saveQuestion: "{% url 'update_mcq_question' mcq.id %}",
                 saveOptions: "{% url 'update_mcq_options' mcq.id %}",

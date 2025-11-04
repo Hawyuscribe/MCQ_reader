@@ -8,7 +8,15 @@ from django.utils import timezone
 from django.core.cache import cache
 import json
 
-from .openai_integration import get_first_choice_text
+from .openai_integration import (
+    get_first_choice_text,
+    ai_edit_question,
+    ai_edit_options,
+    ai_improve_all_options,
+    ai_edit_explanation_text,
+    regenerate_unified_explanation,
+)
+from .models import AIEditJob, MCQ
 
 logger = logging.getLogger(__name__)
 
@@ -535,3 +543,182 @@ def process_mcq_to_case_conversion(self, mcq_id, user_id, tracking_id=None):
             'mcq_id': mcq_id,
             'error': str(e)
         }
+
+
+@shared_task(bind=True, max_retries=2)
+def run_ai_edit_job(self, job_id):
+    """
+    Execute queued AI editing jobs (question/options/explanation).
+    """
+    try:
+        job = AIEditJob.objects.select_related("mcq").get(id=job_id)
+    except AIEditJob.DoesNotExist:
+        logger.error("AI edit job %s not found", job_id)
+        return
+
+    if job.status not in {AIEditJob.STATUS_PENDING, AIEditJob.STATUS_FAILED}:
+        logger.info("AI edit job %s skipped (status=%s)", job_id, job.status)
+        return
+
+    job.mark_running()
+
+    payload = job.payload or {}
+    mcq_id = payload.get("mcq_id") or getattr(job.mcq, "id", None)
+
+    try:
+        mcq = MCQ.objects.get(id=mcq_id)
+    except MCQ.DoesNotExist:
+        job.mark_failed(f"MCQ {mcq_id} not found.")
+        return
+
+    try:
+        if job.job_type == AIEditJob.TYPE_QUESTION:
+            custom_instructions = payload.get("custom_instructions", "")
+            improved_text = ai_edit_question(mcq, custom_instructions)
+            job.mark_success(
+                {
+                    "success": True,
+                    "improved_text": improved_text,
+                    "message": "AI has generated an improved question",
+                }
+            )
+            return
+
+        if job.job_type == AIEditJob.TYPE_OPTIONS:
+            mode = payload.get("mode", "fill_missing")
+            custom_instructions = payload.get("custom_instructions", "")
+            draft_question_text = payload.get("question_text")
+            current_options_override = payload.get("current_options")
+            requested_correct_answer = payload.get("correct_answer")
+            auto_regenerate = payload.get("auto_regenerate", True)
+            auto_apply = payload.get("auto_apply", False)
+
+            if isinstance(draft_question_text, str) and draft_question_text.strip():
+                mcq.question_text = draft_question_text
+
+            if isinstance(current_options_override, dict) and current_options_override:
+                mcq.options = current_options_override
+
+            if isinstance(requested_correct_answer, str) and requested_correct_answer.strip():
+                mcq.correct_answer = requested_correct_answer.strip()
+
+            if mode == "fill_missing":
+                improved_options = ai_edit_options(mcq, custom_instructions)
+            else:
+                improved_options = ai_improve_all_options(mcq, custom_instructions)
+
+            response_data = {
+                "success": True,
+                "options": improved_options,
+                "message": f"AI has {'filled missing' if mode == 'fill_missing' else 'improved all'} options",
+            }
+
+            if auto_apply and isinstance(improved_options, dict):
+                try:
+                    mcq.options = improved_options
+                    mcq.save()
+                    mcq.refresh_from_db()
+                    response_data["auto_applied"] = True
+
+                    if auto_regenerate:
+                        try:
+                            regenerated_text = regenerate_unified_explanation(mcq)
+                            if regenerated_text and isinstance(regenerated_text, str):
+                                regenerated_text = regenerated_text.strip()
+                                mcq.unified_explanation = regenerated_text
+                                mcq.explanation = regenerated_text
+                                mcq.explanation_sections = None
+                                mcq.save(
+                                    update_fields=[
+                                        "unified_explanation",
+                                        "explanation",
+                                        "explanation_sections",
+                                    ]
+                                )
+                                from .explanation_utils import render_explanation_as_html
+
+                                response_data["unified_explanation"] = regenerated_text
+                                response_data["html_preview"] = render_explanation_as_html(
+                                    regenerated_text
+                                )
+                                response_data["explanations_regenerated"] = True
+                                response_data["message"] += (
+                                    ", applied changes, and regenerated explanations"
+                                )
+                            else:
+                                response_data["message"] += (
+                                    " and applied changes (explanation regeneration failed)"
+                                )
+                                response_data["explanations_regenerated"] = False
+                                response_data["regeneration_error"] = (
+                                    "AI did not return a valid explanation"
+                                )
+                        except Exception as regen_exc:
+                            response_data["message"] += (
+                                " and applied changes (explanation regeneration failed)"
+                            )
+                            response_data["explanations_regenerated"] = False
+                            response_data["regeneration_error"] = str(regen_exc)
+                except Exception as apply_exc:
+                    response_data["auto_applied"] = False
+                    response_data["error"] = f"Failed to apply changes: {apply_exc}"
+
+            job.mark_success(response_data)
+            return
+
+        if job.job_type == AIEditJob.TYPE_EXPLANATION:
+            current_content = payload.get("current_content", "")
+            custom_instructions = payload.get("custom_instructions", "")
+            target_mode = payload.get("mode", "enhance")
+            section_name = payload.get("section_name")
+            enhanced_content = ai_edit_explanation_text(
+                mcq,
+                current_content=current_content,
+                custom_instructions=custom_instructions,
+                mode=target_mode,
+            )
+            if not enhanced_content or not isinstance(enhanced_content, str):
+                raise ValueError("AI returned empty content for this explanation.")
+            job.mark_success(
+                {
+                    "success": True,
+                    "enhanced_content": enhanced_content.strip(),
+                    "section_name": section_name,
+                    "message": "AI has enhanced the explanation.",
+                }
+            )
+            return
+
+        if job.job_type == AIEditJob.TYPE_EXPLANATION_REGENERATE:
+            custom_instructions = payload.get("custom_instructions", "")
+            regenerated_text = regenerate_unified_explanation(
+                mcq, custom_instructions=custom_instructions
+            )
+
+            if not regenerated_text or not regenerated_text.strip():
+                raise ValueError("Failed to regenerate the explanation.")
+
+            regenerated_text = regenerated_text.strip()
+            mcq.unified_explanation = regenerated_text
+            mcq.explanation = regenerated_text
+            mcq.explanation_sections = None
+            mcq.save(update_fields=["unified_explanation", "explanation", "explanation_sections"])
+
+            from .explanation_utils import render_explanation_as_html
+
+            job.mark_success(
+                {
+                    "success": True,
+                    "message": "Explanation regenerated successfully",
+                    "unified_explanation": regenerated_text,
+                    "html_preview": render_explanation_as_html(regenerated_text),
+                }
+            )
+            return
+
+        job.mark_failed(f"Unknown job type: {job.job_type}")
+    except Exception as exc:
+        logger.exception("AI edit job %s failed: %s", job_id, exc)
+        job.mark_failed(str(exc))
+        if self.request.retries < self.max_retries:
+            raise self.retry(countdown=10 * (2 ** self.request.retries))

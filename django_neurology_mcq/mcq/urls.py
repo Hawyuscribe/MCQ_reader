@@ -114,6 +114,7 @@ urlpatterns = [
     path('mcq/<int:mcq_id>/ai/edit/options/', views.ai_edit_mcq_options, name='ai_edit_mcq_options'),
     path('mcq/<int:mcq_id>/ai/edit/explanation/', views.ai_edit_mcq_explanation, name='ai_edit_mcq_explanation'),
     path('mcq/<int:mcq_id>/ai/regenerate-all-explanations/', views.regenerate_all_explanations, name='regenerate_all_explanations'),
+    path('mcq/ai/jobs/<uuid:job_id>/', views.ai_job_status, name='ai_job_status'),
     
     # Debug URL (TEMPORARY)
     path('debug/mcq-ids/', views.debug_mcq_ids, name='debug_mcq_ids'),

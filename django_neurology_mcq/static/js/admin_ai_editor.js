@@ -241,6 +241,44 @@
     return state.endpoints[name];
   }
 
+  const JOB_STATUS_PLACEHOLDER = '00000000-0000-0000-0000-000000000000';
+
+  function buildJobStatusUrl(jobId) {
+    const template = ensureEndpoint('jobStatus');
+    if (!template) {
+      throw new Error('Job status endpoint is not configured.');
+    }
+    return template.replace(JOB_STATUS_PLACEHOLDER, jobId);
+  }
+
+  async function fetchJobStatus(jobId, label) {
+    const response = await fetch(buildJobStatusUrl(jobId), {
+      headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    });
+    if (!response.ok) {
+      throw new Error(`Job status request failed (HTTP ${response.status})`);
+    }
+    const data = await response.json();
+    adminDebugLog(`⏳ [${label}] Job ${jobId} status: ${data.status}`);
+    return data;
+  }
+
+  async function waitForJobCompletion(jobId, label) {
+    let attempts = 0;
+    while (true) {
+      const info = await fetchJobStatus(jobId, label);
+      if (info.status === 'succeeded') {
+        return info.result || {};
+      }
+      if (info.status === 'failed') {
+        throw new Error(info.error || 'AI job failed.');
+      }
+      const delayMs = Math.min(2000 + attempts * 500, 6000);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      attempts += 1;
+    }
+  }
+
   /* -------------------------------------------------------------------------- */
   /* Instruction Modal + Recorder                                               */
   /* -------------------------------------------------------------------------- */
@@ -924,22 +962,30 @@
       const payload = {
         custom_instructions: instructions || ''
       };
-      const data = await postJson(
+      const queueResponse = await postJson(
         ensureEndpoint('question'),
         payload,
         'Question AI'
       );
 
-      if (data.success && validateQuestionResponse(data.improved_text)) {
-        textarea.value = data.improved_text;
-        renderQuestionDisplay(data.improved_text);
-        state.question.lastSuccessfulText = data.improved_text;
+      const jobId = queueResponse.job_id;
+      if (!jobId) {
+        throw new Error(queueResponse.error || 'Server did not return a job identifier.');
+      }
+      adminDebugLog(`🧵 [Question AI] Job queued (${jobId}).`);
+
+      const result = await waitForJobCompletion(jobId, 'Question AI');
+
+      if (result.success && validateQuestionResponse(result.improved_text)) {
+        textarea.value = result.improved_text;
+        renderQuestionDisplay(result.improved_text);
+        state.question.lastSuccessfulText = result.improved_text;
         textarea.classList.remove('is-invalid');
         textarea.classList.add('is-valid');
-        showSuccessMessage('AI has improved the question. Review and save when ready.');
+        showSuccessMessage(result.message || 'AI has improved the question. Review and save when ready.');
       } else {
         const errorMsg =
-          data.error ||
+          (result && result.error) ||
           'AI returned an incomplete response. Your previous draft has been restored.';
         const fallbackText = state.question.lastSuccessfulText || previousDraft;
         textarea.value = fallbackText;
@@ -1068,17 +1114,25 @@
         correct_answer: state.options.correctSelect ? state.options.correctSelect.value : 'A'
       };
 
-      const data = await postJson(
+      const queueResponse = await postJson(
         ensureEndpoint('options'),
         payload,
         'Options AI'
       );
 
-      if (data.success && data.options) {
+      const jobId = queueResponse.job_id;
+      if (!jobId) {
+        throw new Error(queueResponse.error || 'Server did not return a job identifier.');
+      }
+      adminDebugLog(`🧵 [Options AI] Job queued (${jobId}).`);
+
+      const result = await waitForJobCompletion(jobId, 'Options AI');
+
+      if (result.success && result.options) {
         let updatedCount = 0;
         ['A', 'B', 'C', 'D'].forEach((letter) => {
           const editor = state.options.editors[letter];
-          const newValue = (data.options[letter] || '').trim();
+          const newValue = (result.options[letter] || '').trim();
           if (editor && newValue) {
             editor.value = newValue;
             updatedCount += 1;
@@ -1086,16 +1140,27 @@
         });
 
         if (updatedCount > 0) {
-          const successMessage =
-            mode === 'fill_missing'
-              ? 'AI filled the requested options with USMLE-style distractors. Review and save when ready.'
-              : 'AI improved the distractors. Review and save when ready.';
-          showSuccessMessage(successMessage);
+          showSuccessMessage(
+            result.message ||
+              (mode === 'fill_missing'
+                ? 'AI filled the requested options with USMLE-style distractors. Review and save when ready.'
+                : 'AI improved the distractors. Review and save when ready.')
+          );
         } else {
-          showWarningMessage('AI did not provide any updates. Please refine your instructions.');
+          showWarningMessage(
+            result.message || 'AI did not provide any updates. Please refine your instructions.'
+          );
+        }
+
+        if (result.unified_explanation && result.html_preview) {
+          setUnifiedExplanationText(result.unified_explanation);
+          const explanationContent = document.querySelector('#explanation .explanation-content');
+          if (explanationContent) {
+            explanationContent.innerHTML = result.html_preview;
+          }
         }
       } else {
-        const errorMsg = data.error || 'AI could not update options.';
+        const errorMsg = (result && result.error) || 'AI could not update options.';
         showWarningMessage(errorMsg);
       }
     } catch (error) {
@@ -1105,92 +1170,7 @@
     }
   }
 
-  async function handleExplanationAI(targetId) {
-    const textarea = document.getElementById(targetId);
-    if (!textarea) {
-      alert('Unable to locate the explanation editor. Please reload and try again.');
-      adminDebugLog(`❌ [Explanation AI] Textarea ${targetId} not found.`, 'error');
-      return;
-    }
-
-    adminDebugLog(
-      `🧠 [Explanation AI] Triggered for unified explanation. Current length: ${textarea.value.length}`
-    );
-
-    const { confirmed, instructions } = await state.modals.instruction.prompt({
-      title: 'AI Assist: Explanation',
-      description:
-        'Optional: specify teaching goals, tone, or references you want emphasized while the explanation is refined.',
-      placeholder:
-        'Example: keep board-style bullet points, mention latest AAN guideline update.'
-    });
-
-    if (!confirmed) {
-      adminDebugLog('⚪️ [Explanation AI] Cancelled by user.');
-      return;
-    }
-
-    textarea.disabled = true;
-    const originalValue = textarea.value;
-    showLoadingMessage('AI is enhancing the explanation...');
-    const button = document.querySelector(`.js-ai-explanation[data-ai-target="${targetId}"]`);
-    toggleButtonLoading(
-      button,
-      true,
-      button ? button.innerHTML : '',
-      'Enhancing…'
-    );
-
-    try {
-      const payload = {
-        current_content: originalValue,
-        custom_instructions: instructions || ''
-      };
-      const data = await postJson(
-        ensureEndpoint('explanation'),
-        payload,
-        'Explanation AI'
-      );
-
-      const enhanced = (data.enhanced_content || '').trim();
-      if (data.success && enhanced) {
-        textarea.value = enhanced;
-        textarea.classList.remove('is-invalid');
-        state.explanation.lastSuccessfulText = enhanced;
-        updateExplanationMetrics();
-        showSuccessMessage('AI has enhanced the explanation. Review and save when ready.');
-        adminDebugLog(`✅ [Explanation AI] Success. New length: ${enhanced.length}.`);
-      } else {
-        textarea.classList.add('is-invalid');
-        textarea.value = originalValue;
-        updateExplanationMetrics();
-        const errorMsg =
-          data.error ||
-          'AI returned an incomplete response. Your previous draft has been restored.';
-        showWarningMessage(errorMsg);
-        adminDebugLog('⚠️ [Explanation AI] Empty response - kept original content.', 'warn');
-      }
-    } catch (error) {
-      textarea.classList.add('is-invalid');
-      textarea.value = originalValue;
-      updateExplanationMetrics();
-      showWarningMessage(error.message || 'AI explanation editor is unavailable right now.');
-      adminDebugLog(`❌ [Explanation AI] Request failed: ${error}`, 'error');
-    } finally {
-      textarea.disabled = false;
-      toggleButtonLoading(button, false, '<i class="bi bi-magic"></i> Edit with AI');
-    }
-  }
-
   async function handleRewriteExplanation() {
-    const confirmRewrite = confirm(
-      'AI will rewrite the entire explanation and overwrite the current draft. Continue?'
-    );
-    if (!confirmRewrite) {
-      adminDebugLog('⚪️ [Rewrite AI] User cancelled regeneration.');
-      return;
-    }
-
     const { confirmed, instructions } = await state.modals.instruction.prompt({
       title: 'Rewrite Entire Explanation',
       description:
@@ -1216,24 +1196,33 @@
       const payload = {
         custom_instructions: instructions || ''
       };
-      const data = await postJson(
+      const queueResponse = await postJson(
         ensureEndpoint('regenerate'),
         payload,
         'Rewrite AI'
       );
-      if (data.success && (data.unified_explanation || '').trim()) {
-        setUnifiedExplanationText(data.unified_explanation.trim());
-        state.explanation.lastSuccessfulText = data.unified_explanation.trim();
-        if (data.html_preview) {
+
+      const jobId = queueResponse.job_id;
+      if (!jobId) {
+        throw new Error(queueResponse.error || 'Server did not return a job identifier.');
+      }
+      adminDebugLog(`🧵 [Rewrite AI] Job queued (${jobId}).`);
+
+      const result = await waitForJobCompletion(jobId, 'Rewrite AI');
+
+      if (result.success && (result.unified_explanation || '').trim()) {
+        setUnifiedExplanationText(result.unified_explanation.trim());
+        state.explanation.lastSuccessfulText = result.unified_explanation.trim();
+        if (result.html_preview) {
           const explanationContent = document.querySelector('#explanation .explanation-content');
           if (explanationContent) {
-            explanationContent.innerHTML = data.html_preview;
+            explanationContent.innerHTML = result.html_preview;
           }
         }
-        showSuccessMessage('AI generated a new explanation. Review and save when ready.');
+        showSuccessMessage(result.message || 'AI generated a new explanation. Review and save when ready.');
         adminDebugLog('✅ [Rewrite AI] Unified explanation hydrated into editor.');
       } else {
-        const message = data.error || 'Unable to regenerate the explanation. Please try again.';
+        const message = (result && result.error) || 'Unable to regenerate the explanation. Please try again.';
         adminDebugLog(`❌ [Rewrite AI] API returned error: ${message}`, 'error');
         showWarningMessage(message);
       }
@@ -1244,7 +1233,7 @@
       toggleButtonLoading(
         rewriteButton,
         false,
-        '<i class="bi bi-stars"></i> Rewrite entire explanation'
+        '<i class="bi bi-magic"></i> Rewrite with AI'
       );
     }
   }
@@ -1263,13 +1252,6 @@
     if (optionsBtn) {
       optionsBtn.addEventListener('click', handleOptionsAI);
     }
-
-    document.querySelectorAll('.js-ai-explanation').forEach((button) => {
-      button.addEventListener('click', () => {
-        const target = button.getAttribute('data-ai-target');
-        handleExplanationAI(target);
-      });
-    });
 
     const rewriteButton = document.getElementById('rewriteExplanationBtn');
     if (rewriteButton) {

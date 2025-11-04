@@ -11,6 +11,7 @@ from django.dispatch import receiver
 import json
 from django.utils import timezone
 from datetime import timedelta, datetime
+import uuid
 
 # Import High-yield Review models
 from .high_yield_models import HighYieldSpecialty, HighYieldTopic, TopicSectionImage
@@ -911,6 +912,92 @@ class AdminDebugEvent(models.Model):
             'user': self.user.username if self.user else None,
             'session_key': self.session_key,
         }
+
+
+class AIEditJob(models.Model):
+    """Tracks asynchronous AI editing jobs processed via Celery."""
+
+    TYPE_QUESTION = "question_edit"
+    TYPE_OPTIONS = "options_edit"
+    TYPE_EXPLANATION = "explanation_edit"
+    TYPE_EXPLANATION_REGENERATE = "explanation_regenerate"
+
+    JOB_TYPE_CHOICES = [
+        (TYPE_QUESTION, _("Question Edit")),
+        (TYPE_OPTIONS, _("Options Edit")),
+        (TYPE_EXPLANATION, _("Explanation Edit")),
+        (TYPE_EXPLANATION_REGENERATE, _("Explanation Regenerate")),
+    ]
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_SUCCEEDED = "succeeded"
+    STATUS_FAILED = "failed"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, _("Pending")),
+        (STATUS_RUNNING, _("Running")),
+        (STATUS_SUCCEEDED, _("Succeeded")),
+        (STATUS_FAILED, _("Failed")),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    mcq = models.ForeignKey(
+        MCQ,
+        on_delete=models.CASCADE,
+        related_name="ai_jobs",
+        help_text=_("The MCQ this AI job operates on."),
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ai_jobs",
+        help_text=_("User who triggered the job."),
+    )
+    job_type = models.CharField(max_length=40, choices=JOB_TYPE_CHOICES)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    payload = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["job_type", "-created_at"]),
+            models.Index(fields=["status", "-created_at"]),
+        ]
+        verbose_name = _("AI Edit Job")
+        verbose_name_plural = _("AI Edit Jobs")
+
+    def mark_running(self):
+        self.status = self.STATUS_RUNNING
+        self.started_at = timezone.now()
+        self.error = ""
+        self.save(update_fields=["status", "started_at", "error", "updated_at"])
+
+    def mark_success(self, result: dict):
+        self.status = self.STATUS_SUCCEEDED
+        self.result = result or {}
+        self.completed_at = timezone.now()
+        self.save(update_fields=["status", "result", "completed_at", "updated_at"])
+
+    def mark_failed(self, error_message: str):
+        self.status = self.STATUS_FAILED
+        self.error = error_message or "Unknown error"
+        self.completed_at = timezone.now()
+        self.save(update_fields=["status", "error", "completed_at", "updated_at"])
+
+    @property
+    def duration_seconds(self):
+        if self.completed_at and self.started_at:
+            return max((self.completed_at - self.started_at).total_seconds(), 0)
+        return None
 
 
 class HiddenMCQ(models.Model):

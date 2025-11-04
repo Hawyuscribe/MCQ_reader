@@ -35,9 +35,10 @@ from .models import (
     ReasoningSession,
     QuestionReport,
     PersistentCaseLearningSession,
-    CognitiveReasoningSession,
-    MCQCaseConversionSession,
+   CognitiveReasoningSession,
+   MCQCaseConversionSession,
     AdminDebugEvent,
+    AIEditJob,
 )
 try:
     from .models import HiddenMCQ
@@ -56,6 +57,7 @@ from .openai_integration import (
 from django.core.cache import cache
 import uuid
 from .admin_debug import record_admin_debug_event, serialize_events
+from .tasks import run_ai_edit_job
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -4032,26 +4034,36 @@ def ai_edit_mcq_question(request, mcq_id):
         
         logger.info(f"AI edit question request for MCQ #{mcq_id}, custom_instructions length: {len(custom_instructions)}")
         
-        # Import AI function
-        from .openai_integration import ai_edit_question, api_key, client
+        # Ensure OpenAI is available
+        from .openai_integration import api_key, client
         
-        # Check if OpenAI is available
         if not api_key or not client:
             return JsonResponse({
                 'success': False,
                 'error': 'OpenAI API is not configured. Please set the OPENAI_API_KEY environment variable.'
             }, status=503)
-        
-        # Get AI-improved question
-        improved_question = ai_edit_question(mcq, custom_instructions)
-        
-        logger.info(f"AI edit question successful for MCQ #{mcq_id}")
-        
-        return JsonResponse({
-            'success': True,
-            'improved_text': improved_question,
-            'message': 'AI has generated an improved question'
-        })
+        job = AIEditJob.objects.create(
+            mcq=mcq,
+            user=request.user,
+            job_type=AIEditJob.TYPE_QUESTION,
+            payload={
+                'mcq_id': mcq.id,
+                'custom_instructions': custom_instructions,
+            },
+        )
+
+        run_ai_edit_job.delay(str(job.id))
+
+        logger.info("Queued AI question edit job %s for MCQ #%s", job.id, mcq_id)
+
+        return JsonResponse(
+            {
+                'success': True,
+                'job_id': str(job.id),
+                'message': 'AI question edit queued for processing',
+            },
+            status=202,
+        )
         
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error in ai_edit_mcq_question: {e}")
@@ -4085,10 +4097,8 @@ def ai_edit_mcq_options(request, mcq_id):
         
         logger.info(f"AI edit options request for MCQ #{mcq_id}, mode: {mode}, custom_instructions length: {len(custom_instructions)}")
         
-        # Import AI functions
-        from .openai_integration import ai_edit_options, ai_improve_all_options, regenerate_unified_explanation, api_key, client
-        
-        # Check if OpenAI is available
+        from .openai_integration import api_key, client
+
         if not api_key or not client:
             return JsonResponse({
                 'success': False,
@@ -4108,77 +4118,36 @@ def ai_edit_mcq_options(request, mcq_id):
         if isinstance(requested_correct_answer, str) and requested_correct_answer.strip():
             mcq.correct_answer = requested_correct_answer.strip()
         
-        # Get AI-improved options based on mode
-        if mode == 'fill_missing':
-            improved_options = ai_edit_options(mcq, custom_instructions)
-        else:  # improve_all
-            improved_options = ai_improve_all_options(mcq, custom_instructions)
-        
-        response_data = {
-            'success': True,
-            'options': improved_options,
-            'message': f'AI has {"filled missing" if mode == "fill_missing" else "improved all"} options'
+        job_payload = {
+            'mcq_id': mcq.id,
+            'mode': mode,
+            'custom_instructions': custom_instructions,
+            'question_text': draft_question_text,
+            'current_options': current_options_override,
+            'correct_answer': requested_correct_answer,
+            'auto_regenerate': auto_regenerate,
+            'auto_apply': auto_apply,
         }
-        
-        # If auto_apply is true, save the options and regenerate explanations
-        if auto_apply and improved_options:
-            try:
-                # Update MCQ options
-                mcq.options = improved_options
-                mcq.save()
-                
-                # Refresh from database to ensure we have the latest data
-                mcq.refresh_from_db()
-                
-                logger.info(f"Auto-applied AI-improved options to MCQ #{mcq_id}")
-                
-                # Auto-regenerate explanations if requested
-                regeneration_error = None
-                regenerated_explanations = ""
-                if auto_regenerate:
-                    try:
-                        regenerated_text = regenerate_unified_explanation(mcq)
 
-                        if regenerated_text and isinstance(regenerated_text, str):
-                            regenerated_explanations = regenerated_text.strip()
-                            mcq.unified_explanation = regenerated_explanations
-                            mcq.explanation = regenerated_explanations
-                            mcq.explanation_sections = None
-                            mcq.save(update_fields=["unified_explanation", "explanation", "explanation_sections"])
-                            logger.info(f"Auto-regenerated explanations for MCQ #{mcq_id} after AI options update")
+        job = AIEditJob.objects.create(
+            mcq=mcq,
+            user=request.user,
+            job_type=AIEditJob.TYPE_OPTIONS,
+            payload=job_payload,
+        )
 
-                            from .explanation_utils import render_explanation_as_html
+        run_ai_edit_job.delay(str(job.id))
 
-                            response_data['unified_explanation'] = regenerated_explanations
-                            response_data['html_preview'] = render_explanation_as_html(regenerated_explanations)
-                            response_data['explanations_regenerated'] = True
-                            response_data['message'] += ', applied changes, and regenerated explanations'
-                        else:
-                            logger.warning(f"Failed to regenerate explanations for MCQ #{mcq_id} - invalid response")
-                            regeneration_error = "AI did not return a valid explanation"
-                            response_data['message'] += ' and applied changes (explanation regeneration failed)'
-                    except Exception as regen_e:
-                        error_msg = str(regen_e)
-                        logger.error(f"Error regenerating explanations: {error_msg}")
-                        regeneration_error = f"Regeneration error: {error_msg}"
-                        response_data['message'] += ' and applied changes (explanation regeneration failed)'
-                else:
-                    response_data['message'] += ' and applied changes'
-                
-                if regeneration_error:
-                    response_data['regeneration_error'] = regeneration_error
-                    response_data['explanations_regenerated'] = False
-                    
-                response_data['auto_applied'] = True
-                
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error auto-applying AI options: {error_msg}")
-                response_data['error'] = f"Failed to apply changes: {error_msg}"
-                response_data['auto_applied'] = False
-        
-        logger.info(f"AI edit options successful for MCQ #{mcq_id}")
-        return JsonResponse(response_data)
+        logger.info("Queued AI options edit job %s for MCQ #%s (mode=%s)", job.id, mcq_id, mode)
+
+        return JsonResponse(
+            {
+                'success': True,
+                'job_id': str(job.id),
+                'message': 'AI options edit queued for processing',
+            },
+            status=202,
+        )
         
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error in ai_edit_mcq_options: {e}")
@@ -4214,8 +4183,7 @@ def ai_edit_mcq_explanation(request, mcq_id):
             len(custom_instructions),
         )
 
-        # Import AI function
-        from .openai_integration import ai_edit_explanation_text, api_key, client
+        from .openai_integration import api_key, client
 
         # Check if OpenAI is available
         if not api_key or not client:
@@ -4224,27 +4192,31 @@ def ai_edit_mcq_explanation(request, mcq_id):
                 'error': 'OpenAI API is not configured. Please set the OPENAI_API_KEY environment variable.'
             }, status=503)
 
-        enhanced_content = ai_edit_explanation_text(
-            mcq,
-            current_content,
-            custom_instructions
+        job = AIEditJob.objects.create(
+            mcq=mcq,
+            user=request.user,
+            job_type=AIEditJob.TYPE_EXPLANATION,
+            payload={
+                'mcq_id': mcq.id,
+                'section_name': section_name,
+                'current_content': current_content,
+                'custom_instructions': custom_instructions,
+                'mode': data.get('mode', 'enhance'),
+            },
         )
 
-        if not isinstance(enhanced_content, str) or not enhanced_content.strip():
-            logger.warning("AI returned empty content when enhancing explanation for MCQ #%s", mcq_id)
-            return JsonResponse({
-                'success': False,
-                'error': 'AI returned empty content for this explanation.',
-                'section_name': section_name,
-            })
+        run_ai_edit_job.delay(str(job.id))
 
-        logger.info("AI edit explanation successful for MCQ #%s", mcq_id)
-        return JsonResponse({
-            'success': True,
-            'enhanced_content': enhanced_content.strip(),
-            'section_name': section_name,
-            'message': 'AI has enhanced the explanation.',
-        })
+        logger.info("Queued AI explanation edit job %s for MCQ #%s", job.id, mcq_id)
+        return JsonResponse(
+            {
+                'success': True,
+                'job_id': str(job.id),
+                'section_name': section_name,
+                'message': 'AI explanation edit queued for processing',
+            },
+            status=202,
+        )
         
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error in ai_edit_mcq_explanation: {e}")
@@ -4277,31 +4249,26 @@ def regenerate_all_explanations(request, mcq_id):
             logger.info(f"Custom instructions provided for MCQ #{mcq_id} explanation regeneration ({len(custom_instructions)} chars)")
 
         # Import AI function
-        from .openai_integration import regenerate_unified_explanation
-        from .explanation_utils import render_explanation_as_html
-
-        regenerated_text = regenerate_unified_explanation(
-            mcq,
-            custom_instructions=custom_instructions,
+        job = AIEditJob.objects.create(
+            mcq=mcq,
+            user=request.user,
+            job_type=AIEditJob.TYPE_EXPLANATION_REGENERATE,
+            payload={
+                'mcq_id': mcq.id,
+                'custom_instructions': custom_instructions,
+            },
         )
 
-        if regenerated_text and regenerated_text.strip():
-            regenerated_text = regenerated_text.strip()
-            mcq.unified_explanation = regenerated_text
-            mcq.explanation = regenerated_text
-            mcq.explanation_sections = None
-            mcq.save(update_fields=["unified_explanation", "explanation", "explanation_sections"])
+        run_ai_edit_job.delay(str(job.id))
 
-            return JsonResponse({
+        return JsonResponse(
+            {
                 'success': True,
-                'message': 'Explanation regenerated successfully',
-                'unified_explanation': regenerated_text,
-                'html_preview': render_explanation_as_html(regenerated_text),
-            })
-        return JsonResponse({
-            'success': False,
-            'error': 'Failed to regenerate the explanation. OpenAI API may be unavailable.'
-        })
+                'job_id': str(job.id),
+                'message': 'Explanation regeneration queued for processing',
+            },
+            status=202,
+        )
 
     except ValueError as e:
         logger.error(f"Validation error regenerating explanations for MCQ #{mcq_id}: {str(e)}")
@@ -4313,8 +4280,30 @@ def regenerate_all_explanations(request, mcq_id):
         logger.error(f"Error regenerating all explanations for MCQ #{mcq_id}: {str(e)}")
         return JsonResponse({
             'success': False,
-            'error': f'Failed to regenerate explanations: {str(e)}'
+            'error': f'Failed to queue explanation regeneration: {str(e)}'
         }, status=500)
+
+
+@login_required
+@staff_member_required
+def ai_job_status(request, job_id):
+    """Return the status and result of an asynchronous AI edit job."""
+    job = get_object_or_404(AIEditJob, id=job_id)
+
+    return JsonResponse(
+        {
+            'job_id': str(job.id),
+            'mcq_id': job.mcq_id,
+            'job_type': job.job_type,
+            'status': job.status,
+            'result': job.result,
+            'error': job.error,
+            'created_at': job.created_at.isoformat(),
+            'updated_at': job.updated_at.isoformat(),
+            'started_at': job.started_at.isoformat() if job.started_at else None,
+            'completed_at': job.completed_at.isoformat() if job.completed_at else None,
+        }
+    )
 
 
 @login_required
